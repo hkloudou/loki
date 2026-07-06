@@ -1,0 +1,1 @@
+.\devcon.exe -r install .\hidriver.inf "root\hidriver"
