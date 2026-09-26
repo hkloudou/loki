@@ -29,29 +29,47 @@ service duplicates its own SYSTEM token and retargets it with
 `Winlogon` desktop; a SYSTEM-in-session agent can, and it *follows* the active
 input desktop with `OpenInputDesktop` + `SetThreadDesktop` before every event.
 
-## Integration with your existing LocalSystem service
+## What your LocalSystem process actually does
 
-You already have a process running as LocalSystem. Link this package and call one
-function; it spawns the agent and hands you a driver-like object:
+Your process runs in Session 0 and must **not** call `SendInput` itself. Its job:
+
+1. Launch the agent into the active session (as SYSTEM-in-session).
+2. Relaunch it when the session changes (logon / unlock / RDP / fast-user-switch)
+   or when the agent dies.
+3. Forward the input events it receives from the remote peer to the current agent.
+4. Close the agent on shutdown.
+
+Steps 1, 2 and 4 are handled for you by **`Manager`** — this is the recommended
+entry point. Link the package, construct a `Manager`, `Start()` it, then just call
+input methods from your transport loop:
 
 ```go
 import "github.com/hkloudou/loki/sysinput"
 
-// From inside your LocalSystem service:
-agent, err := sysinput.LaunchAgentInActiveSession(`C:\Program Files\loki\loki-inputagent.exe`)
-if err != nil { /* e.g. no user logged on */ }
-defer agent.Close()
+mgr := sysinput.NewManager(`C:\Program Files\loki\loki-inputagent.exe`)
+mgr.SetLogger(func(s string){ log.Println("[sysinput]", s) })
+mgr.Start()
+defer mgr.Stop()
 
-agent.MoveTo(400, 300)          // absolute, virtual-screen pixels
-agent.Click(sysinput.Left)
-agent.KeyTap(sysinput.VKReturn)
-agent.Type("你好, world")        // Unicode, layout-independent
-agent.Wheel(-3)                  // scroll down 3 notches
+// in your remote-input handler:
+mgr.MoveTo(400, 300)      // absolute, virtual-screen pixels
+mgr.Click(sysinput.Left)
+mgr.KeyTap(sysinput.VKReturn)
+mgr.Type("你好, world")    // Unicode, layout-independent
+mgr.Wheel(-3)             // scroll down 3 notches
+// methods return sysinput.ErrNoSession while no user is logged on.
 ```
 
-The service talks to the agent over the agent's **stdin pipe** (newline-delimited
-JSON) — no named pipe, no extra ACLs. Commands are applied in order on the active
-desktop.
+`Manager` polls `WTSGetActiveConsoleSessionId` (default every 1s) and checks agent
+liveness, relaunching as needed — so you don't have to wire an SCM
+`SERVICE_CONTROL_SESSIONCHANGE` handler. If you *are* a real SCM service and want
+instant reaction, you can additionally call `LaunchAgentInActiveSession` yourself
+from a session-change handler; the low-level API is exported for that. See
+[examples/localsystem](../examples/localsystem).
+
+Under the hood the process talks to the agent over the agent's **stdin pipe**
+(newline-delimited JSON) — no named pipe, no extra ACLs. Commands are applied in
+order on the active desktop.
 
 Build the agent binary:
 

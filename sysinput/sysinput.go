@@ -33,6 +33,10 @@ import (
 // ErrUnsupported is returned by all entry points on non-Windows platforms.
 var ErrUnsupported = errors.New("sysinput: only supported on Windows")
 
+// ErrNoSession is returned by Manager input methods when there is currently no
+// live agent (e.g. no user is logged on, or the agent is being relaunched).
+var ErrNoSession = errors.New("sysinput: no active input agent")
+
 // Button is a mouse button bitmask value.
 type Button int
 

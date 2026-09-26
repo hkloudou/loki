@@ -11,8 +11,11 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
+
+const waitTimeout = 0x00000102 // WAIT_TIMEOUT: object still not signaled
 
 var (
 	user32   = syscall.NewLazyDLL("user32.dll")
@@ -25,12 +28,12 @@ var (
 	procCloseDesktop     = user32.NewProc("CloseDesktop")
 	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 
-	procWTSActiveSession     = kernel32.NewProc("WTSGetActiveConsoleSessionId")
-	procCreatePipe           = kernel32.NewProc("CreatePipe")
-	procSetHandleInfo        = kernel32.NewProc("SetHandleInformation")
-	procCloseHandle          = kernel32.NewProc("CloseHandle")
-	procGetCurrentProcess    = kernel32.NewProc("GetCurrentProcess")
-	procProcessIdToSessionId = kernel32.NewProc("ProcessIdToSessionId")
+	procWTSActiveSession  = kernel32.NewProc("WTSGetActiveConsoleSessionId")
+	procCreatePipe        = kernel32.NewProc("CreatePipe")
+	procSetHandleInfo     = kernel32.NewProc("SetHandleInformation")
+	procCloseHandle       = kernel32.NewProc("CloseHandle")
+	procGetCurrentProcess = kernel32.NewProc("GetCurrentProcess")
+	procWaitForSingleObj  = kernel32.NewProc("WaitForSingleObject")
 
 	procOpenProcessToken     = advapi32.NewProc("OpenProcessToken")
 	procDuplicateTokenEx     = advapi32.NewProc("DuplicateTokenEx")
@@ -155,6 +158,18 @@ type AgentProcess struct {
 
 // PID returns the agent process id.
 func (p *AgentProcess) PID() uint32 { return p.pid }
+
+// Alive reports whether the agent process is still running.
+func (p *AgentProcess) Alive() bool {
+	p.mu.Lock()
+	h := p.proc
+	p.mu.Unlock()
+	if h == 0 {
+		return false
+	}
+	r, _, _ := procWaitForSingleObj.Call(uintptr(h), 0)
+	return r == waitTimeout
+}
 
 // ActiveConsoleSessionID returns the session id of the physical console, or
 // 0xFFFFFFFF when no user is logged on.
@@ -323,6 +338,197 @@ func (p *AgentProcess) Close() error {
 }
 
 func quoteArg(s string) string { return `"` + s + `"` }
+
+// ==========================================================================
+// Manager: keeps exactly one live agent for the active console session.
+// This is what your LocalSystem process should use directly.
+// ==========================================================================
+
+// Manager owns the agent lifecycle so your LocalSystem process doesn't have to.
+// It launches an agent for the active console session, relaunches it when the
+// session changes (logon/unlock/RDP/fast-user-switch) or the agent dies, and
+// forwards input to whichever agent is current. Input methods return
+// ErrNoSession while no agent is available (e.g. at the logon screen with no
+// user, between relaunches). All methods are safe for concurrent use.
+type Manager struct {
+	agentPath string
+	agentArgs []string
+	interval  time.Duration
+	onEvent   func(string) // optional log hook
+
+	mu         sync.Mutex
+	agent      *AgentProcess
+	curSession uint32
+
+	stop chan struct{}
+	done chan struct{}
+}
+
+// NewManager creates a Manager for the given agent executable path. Extra args
+// are passed to the agent on launch.
+func NewManager(agentPath string, agentArgs ...string) *Manager {
+	return &Manager{
+		agentPath:  agentPath,
+		agentArgs:  agentArgs,
+		interval:   time.Second,
+		curSession: 0xFFFFFFFF,
+	}
+}
+
+// SetPollInterval changes how often the Manager reconciles session/agent state
+// (default 1s). Call before Start.
+func (m *Manager) SetPollInterval(d time.Duration) {
+	if d > 0 {
+		m.interval = d
+	}
+}
+
+// SetLogger installs a callback for lifecycle events (launch, relaunch, errors).
+func (m *Manager) SetLogger(fn func(string)) { m.onEvent = fn }
+
+func (m *Manager) log(format string, a ...any) {
+	if m.onEvent != nil {
+		m.onEvent(fmt.Sprintf(format, a...))
+	}
+}
+
+// Start begins the background reconcile loop and launches an agent immediately
+// if a user is logged on.
+func (m *Manager) Start() {
+	m.stop = make(chan struct{})
+	m.done = make(chan struct{})
+	go m.run()
+}
+
+// Stop halts the loop and closes the current agent.
+func (m *Manager) Stop() {
+	if m.stop != nil {
+		close(m.stop)
+		<-m.done
+	}
+}
+
+func (m *Manager) run() {
+	defer close(m.done)
+	m.reconcile() // don't wait a full tick for the first launch
+	t := time.NewTicker(m.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stop:
+			m.closeCurrent()
+			return
+		case <-t.C:
+			m.reconcile()
+		}
+	}
+}
+
+// reconcile ensures there is exactly one live agent for the active session.
+func (m *Manager) reconcile() {
+	sid := ActiveConsoleSessionID()
+
+	m.mu.Lock()
+	cur := m.agent
+	curSid := m.curSession
+	m.mu.Unlock()
+
+	if sid == 0xFFFFFFFF { // no user logged on
+		if cur != nil {
+			m.log("no active session; closing agent")
+			m.closeCurrent()
+		}
+		return
+	}
+	if cur != nil && sid == curSid && cur.Alive() {
+		return // healthy, nothing to do
+	}
+
+	// Launch outside the lock (CreateProcessAsUser is comparatively slow).
+	na, err := LaunchAgentInActiveSession(m.agentPath, m.agentArgs...)
+	if err != nil {
+		m.log("launch agent (session %d): %v", sid, err)
+		return
+	}
+	m.mu.Lock()
+	old := m.agent
+	m.agent = na
+	m.curSession = sid
+	m.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	m.log("agent launched in session %d (pid %d)", sid, na.PID())
+}
+
+func (m *Manager) closeCurrent() {
+	m.mu.Lock()
+	old := m.agent
+	m.agent = nil
+	m.curSession = 0xFFFFFFFF
+	m.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+}
+
+// Available reports whether there is currently a live agent to receive input.
+func (m *Manager) Available() bool {
+	m.mu.Lock()
+	a := m.agent
+	m.mu.Unlock()
+	return a != nil && a.Alive()
+}
+
+// with forwards to the current agent, dropping it on error so the loop relaunches.
+func (m *Manager) with(fn func(*AgentProcess) error) error {
+	m.mu.Lock()
+	a := m.agent
+	m.mu.Unlock()
+	if a == nil {
+		return ErrNoSession
+	}
+	if err := fn(a); err != nil {
+		m.mu.Lock()
+		if m.agent == a {
+			m.agent = nil // force relaunch on next reconcile
+		}
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) MoveTo(x, y int) error {
+	return m.with(func(a *AgentProcess) error { return a.MoveTo(x, y) })
+}
+func (m *Manager) Move(dx, dy int) error {
+	return m.with(func(a *AgentProcess) error { return a.Move(dx, dy) })
+}
+func (m *Manager) ButtonDown(b Button) error {
+	return m.with(func(a *AgentProcess) error { return a.ButtonDown(b) })
+}
+func (m *Manager) ButtonUp(b Button) error {
+	return m.with(func(a *AgentProcess) error { return a.ButtonUp(b) })
+}
+func (m *Manager) Click(b Button) error {
+	return m.with(func(a *AgentProcess) error { return a.Click(b) })
+}
+func (m *Manager) Wheel(n int) error {
+	return m.with(func(a *AgentProcess) error { return a.Wheel(n) })
+}
+func (m *Manager) KeyDown(vk, scan uint16) error {
+	return m.with(func(a *AgentProcess) error { return a.KeyDown(vk, scan) })
+}
+func (m *Manager) KeyUp(vk, scan uint16) error {
+	return m.with(func(a *AgentProcess) error { return a.KeyUp(vk, scan) })
+}
+func (m *Manager) KeyTap(vk uint16) error {
+	return m.with(func(a *AgentProcess) error { return a.KeyTap(vk) })
+}
+func (m *Manager) Type(s string) error {
+	return m.with(func(a *AgentProcess) error { return a.Type(s) })
+}
 
 // ==========================================================================
 // Agent side (interactive session): read commands and SendInput.
