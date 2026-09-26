@@ -24,7 +24,17 @@ loki/
     └── lib/      user-mode C++ lib + C-ABI wrapper     -> loki.dll
 ```
 
-Three layers, bottom to top:
+There are **two independent input backends**, chosen per deployment:
+
+- **Driver backend** (root `loki` package + `loki.dll`) — a signed virtual HID
+  driver; input looks like real hardware, so games / anti-cheat tend to accept
+  it. Requires a signed kernel driver.
+- **`sysinput` backend** ([`sysinput/`](sysinput), [docs/sysinput.md](docs/sysinput.md))
+  — driverless: a LocalSystem service spawns an in-session agent that injects via
+  `SendInput`, covering the physical console **and** the secure desktop (UAC /
+  logon). No driver signing; but injected input is detectable by anti-cheat.
+
+The driver stack, bottom to top:
 
 1. **`windows/driver`** — a KMDF kernel driver that registers a virtual HID
    device exposing a mouse collection and a keyboard collection. User mode sends
