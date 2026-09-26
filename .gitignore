@@ -1,0 +1,23 @@
+# Build outputs
+/build/
+*.dll
+*.exp
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.sys
+*.cat
+*.inf.bak
+
+# Go
+*.exe
+*.test
+*.out
+
+# VS / IDE
+.vs/
+*.user
+x64/
+Debug/
+Release/
