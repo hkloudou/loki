@@ -16,6 +16,34 @@ Requires **Visual Studio** + the **Windows Driver Kit (WDK)** matching your VS
 version. Build `loki-driver.vcxproj` as `Release|x64`. Output: `hidriver.sys`,
 `hidriver.inf`, and (when signed) `hidriver.cat`.
 
+## Generating a branded INF
+
+The install strings (`DeviceName`, `DiskName`, `ProviderName`,
+`ManufacturerName`, `ServiceName`) are brandable and support **Chinese**. Use the
+`mkinf` tool to fill them in and emit a correctly-encoded `hidriver.inf`:
+
+```bash
+# from repo root; flags:
+go run ./cmd/mkinf -out windows/driver/hidriver.inf \
+  -device "Loki 虚拟键鼠" -disk "Loki 安装盘" \
+  -provider hkloudou -manufacturer "杭州云侯科技" -service "Loki 虚拟键鼠服务"
+
+# or from a JSON config (see branding.example.json), with a proper zh-CN section:
+go run ./cmd/mkinf -config windows/driver/branding.example.json \
+  -out windows/driver/hidriver.inf
+```
+
+Notes:
+- Non-ASCII values make the tool write **UTF-16LE + BOM** (required for Unicode
+  INFs). A `zhCN` block in the JSON emits a localized `[Strings.0804]` section
+  with an ASCII neutral `[Strings]` fallback.
+- **`ClassName` is coupled to the user-mode lib**: the device is found via
+  `\\?\HID#<ClassName>&Col02#1` / `&Col04#1`. Keep it `HIDRIVER` unless you also
+  edit `windows/lib/mouse.cpp` / `keyboard.cpp`; `mkinf` warns if you change it.
+- Any INF change invalidates the catalog — **regenerate and re-sign
+  `hidriver.cat`** afterwards (`inf2cat` + `signtool`), or for a shipped product
+  choose branding before the one-time Microsoft attestation submission.
+
 ## Install (developer / test mode)
 
 The default build is **test-signed only**, so it needs signature enforcement

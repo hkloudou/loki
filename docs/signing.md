@@ -91,7 +91,37 @@ network, and it emits genuine HID reports.
   gaming/anti-detection rig or a lab, impractical for mass consumer remote
   desktop.
 
-### B3. Existing signed input drivers
+### B3. Reuse the RDP terminal input bus (`TERMINPUT_BUS`)
+
+Windows' own Remote Desktop stack creates virtual HID keyboard/mouse devices per
+remote session, with instance IDs like
+`TERMINPUT_BUS\UMB\...&Session1Keyboard0`. They are produced by Microsoft's
+in-box, signed `rdpbus`/UMBus drivers — so the appeal is "already signed, already
+present."
+
+Two caveats decide how you can use them:
+
+- **You cannot open that devnode and write reports to inject input.** It is an
+  input *source* fed by the RDP wire protocol (the remote client's keystrokes
+  arrive over the RDP virtual channel and the terminal stack emits them through
+  this device). There is no public "write HID output report → input" sink like
+  loki's own driver exposes.
+- **It only exists inside an active terminal session** (`Session1`+), not on the
+  physical console, and Home SKUs have no RDP host.
+
+The usable form of this idea is the **loopback / headless RDP-session
+technique**: start a real terminal session (mstsc to a loopback / second
+session, or a headless RDP session) and inject with `SendInput` *inside that
+session*. The OS then attributes the input to `TERMINPUT_BUS` — a legitimately
+signed HID device — which many games / anti-bot layers accept as real hardware,
+with **no driver signing at all**. Trade-offs: needs an RDP-capable SKU; the
+automated work runs in a session separate from the console (use a virtual display
+or the console locks); and some anti-cheat explicitly flags remote sessions.
+This is a strong signing-free option when a headless/second session is
+acceptable; the custom driver (Option A) remains the choice when you must drive
+the **physical console** with no RDP.
+
+### B4. Existing signed input drivers
 
 If you want kernel-level injection without running your own signing pipeline, you
 can build on a driver someone else already ships signed:
@@ -126,8 +156,9 @@ can build on a driver someone else already ships signed:
 - If the goal is a shippable remote-desktop / RPA core for **normal apps** →
   start with **B1** (SYSTEM service + `SendInput` + `SetThreadDesktop`); no
   signing needed, ships today.
-- If you specifically need input that **games / anti-bot layers accept**, either
-  **A** (EV cert + Microsoft attestation-sign this driver) for a pure-software
-  solution, or **B2** (external USB-HID board) for the strongest,
-  signing-free, hardware-genuine path.
+- If you specifically need input that **games / anti-bot layers accept**: **A**
+  (EV cert + Microsoft attestation-sign this driver) for a pure-software solution
+  that drives the physical console; **B3** (loopback/headless RDP session +
+  `SendInput`) when a separate session is acceptable and you want zero signing;
+  or **B2** (external USB-HID board) for the strongest, hardware-genuine path.
 - The **test certificate** is fine only for **your own dev/CI machines**.

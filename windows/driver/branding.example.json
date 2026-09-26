@@ -1,0 +1,15 @@
+{
+  "deviceName": "Loki Virtual HID",
+  "diskName": "Loki Install Disk",
+  "providerName": "hkloudou",
+  "manufacturerName": "hkloudou",
+  "serviceName": "Loki HID Service",
+  "className": "HIDRIVER",
+  "driverVer": "09/27/2026",
+  "zhCN": {
+    "deviceName": "Loki 虚拟键鼠",
+    "diskName": "Loki 安装盘",
+    "manufacturerName": "杭州云侯科技",
+    "serviceName": "Loki 虚拟键鼠服务"
+  }
+}
